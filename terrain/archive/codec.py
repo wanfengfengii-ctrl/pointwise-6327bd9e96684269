@@ -3,6 +3,7 @@ from dataclasses import dataclass
 from fractions import Fraction
 
 from terrain.band.boundaries import BoundaryRing
+from terrain.band.change import ChangeBandResult, ChangeComponent
 from terrain.band.clipping import BandCell, BandInterval
 from terrain.band.components import AreaLedger, BandComponent, BandResult
 from terrain.contour.assembly import ContourArc, ContourNode, ContourResult
@@ -20,7 +21,8 @@ class ProductPayload:
     kind: str
     revision_id: str
     levels: tuple[Fraction, ...]
-    result: tuple[ContourResult, ...] | BandResult
+    result: tuple[ContourResult, ...] | BandResult | ChangeBandResult
+    revision_ids: tuple[str, ...] | None = None
 
 
 def dumps(value):
@@ -71,12 +73,15 @@ def _decode_points(points):
     return tuple(map(_decode_point, _array(points)))
 
 
-def encode_binding(kind, revision_id, levels):
+def encode_binding(kind, revision_id, levels, revision_ids=None):
+    if kind == 'change_band':
+        return {'kind': kind, 'revisions': list(revision_ids),
+                'levels': [encode_fraction(value) for value in levels]}
     return {'kind': kind, 'revision': revision_id, 'levels': [encode_fraction(value) for value in levels]}
 
 
 def encode_product(payload):
-    binding = encode_binding(payload.kind, payload.revision_id, payload.levels)
+    binding = encode_binding(payload.kind, payload.revision_id, payload.levels, payload.revision_ids)
     geometry, sources = [], []
     if payload.kind == 'contours':
         for contour in payload.result:
@@ -94,6 +99,13 @@ def encode_product(payload):
                              [[_points(cell.points), list(cell.included)] for cell in comp.cells]])
             sources.append(list(comp.faces))
         geometry = [encode_fraction(result.ledger.cell_area), encode_fraction(result.area), geometry]
+    elif payload.kind == 'change_band':
+        result = payload.result
+        for comp in result.components:
+            geometry.append([_points(comp.outer.points), [_points(ring.points) for ring in comp.holes],
+                             encode_fraction(comp.area)])
+            sources.append([[old, new, encode_fraction(area)]
+                            for old, new, area in comp.contributions])
     else:
         raise CodecError(f'unknown product kind {payload.kind!r}')
     return binding, geometry, sources
@@ -139,11 +151,39 @@ def _decode_band(interval, geometry, sources):
     return BandResult(interval, tuple(result), ledger)
 
 
+def _decode_change(levels, geometry, sources):
+    result = []
+    for row, rows in zip(_array(geometry), _array(sources), strict=True):
+        outer, holes, area = _array(row, 3)
+        points = _decode_points(outer)
+        rings = tuple(BoundaryRing(_decode_points(ring)) for ring in _array(holes))
+        if len(points) < 3 or any(len(ring.points) < 3 for ring in rings):
+            raise CodecError('invalid change band ring')
+        contributions = []
+        for source in _array(rows):
+            old, new, value = _array(source, 3)
+            contributions.append((identity(old), identity(new), decode_fraction(value)))
+        result.append(ChangeComponent(BoundaryRing(points), rings, decode_fraction(area),
+                                      tuple(contributions)))
+    return ChangeBandResult(levels, tuple(result))
+
+
 def decode_product(binding, geometry, sources):
     try:
-        if not isinstance(binding, dict) or set(binding) != {'kind', 'revision', 'levels'}:
+        if not isinstance(binding, dict):
             raise CodecError('invalid product binding')
-        kind = binding['kind']
+        kind = binding.get('kind')
+        if kind == 'change_band':
+            if set(binding) != {'kind', 'revisions', 'levels'}:
+                raise CodecError('invalid change band binding')
+            revisions = tuple(map(identity, _array(binding['revisions'], 2)))
+            levels = tuple(map(decode_fraction, _array(binding['levels'], 2)))
+            if levels[0] >= levels[1]:
+                raise CodecError('change band levels must be increasing')
+            return ProductPayload(kind, revisions[0], levels, _decode_change(levels, geometry, sources),
+                                  revisions)
+        if set(binding) != {'kind', 'revision', 'levels'}:
+            raise CodecError('invalid product binding')
         revision = identity(binding['revision'])
         levels = tuple(map(decode_fraction, _array(binding['levels'])))
         if tuple(sorted(set(levels))) != levels:

@@ -49,9 +49,11 @@ def _simple_cycles(points):
             path.append(point)
 
 
-def _canonical_ring(points):
+def canonical_ring(points):
     corners = tuple(p for i, p in enumerate(points)
                     if orient2d(points[i - 1], p, points[(i + 1) % len(points)]) != 0)
+    if not corners:
+        raise ValueError('ring has no corner')
     start = corners.index(min(corners))
     return BoundaryRing(corners[start:] + corners[:start])
 
@@ -90,7 +92,7 @@ def trace_boundary_rings(graph, group):
             raise ValueError('band boundary did not close on its own side')
         for cycle in _simple_cycles(tuple(walk)):
             if len(cycle) >= 3 and signed_ring_area(cycle):
-                rings.append(_canonical_ring(cycle))
+                rings.append(canonical_ring(cycle))
     return tuple(sorted(rings, key=lambda ring: ring.points))
 
 

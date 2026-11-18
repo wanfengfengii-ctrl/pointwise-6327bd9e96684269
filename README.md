@@ -8,15 +8,19 @@
 
 ```sh
 python3 -B -m unittest discover -s tests -t . -v
+python3 -B -m terrain.delivery.verify
 python3 -B -m terrain.archive.api --sample samples/day_shift.json
+python3 -B -m terrain.archive.api --change-demo
+python3 -B -m terrain.delivery.reconcile
+python3 -B change_band_cases.py --exercise
 ```
 
-样例默认在临时目录完成接纳、查询、加工、核账、导出及离线重放。给样例命令追加 `--directory 目录` 可保留 `terrain.sqlite` 和 `delivery.json`，再用 `python3 -B -m terrain.delivery.replay 目录/delivery.json` 独立核账。
+样例默认在临时目录完成接纳、查询、加工、核账、导出及离线重放。给样例命令追加 `--directory 目录` 可保留 `terrain.sqlite` 和 `delivery.json`，再用 `python3 -B -m terrain.delivery.replay 目录/delivery.json` 独立核账。`--change-demo` 在临时目录完成两次测绘的差值带加工、换剖分后重开读取、V2 包导出与离库重放；同样支持 `--directory`。`terrain.delivery.reconcile` 用精确点查询与独立几何推导核账九组差值场景，失败非零退出。
 
 ## 使用接口
 
 ```python
-from terrain.archive.api import build_bands, build_contours
+from terrain.archive.api import build_bands, build_change_band, build_contours
 from terrain.archive.catalog import Catalog
 from terrain.delivery.audit import audit
 from terrain.delivery.read import read_export
@@ -34,10 +38,19 @@ with Catalog('terrain.sqlite') as catalog:
     report = audit(view)
     if report.ok:
         read_export(catalog, ['line-1', 'band-1'], 'delivery.json')
+
+    old = revision
+    new = put_mesh(catalog.meshes, 'survey-2',
+                   [('a', 0, 0, 2), ('b', 1, 0, 1), ('c', 0, 1, 1)],
+                   [('face-1', 'a', 'b', 'c')])
+    change = build_change_band(catalog, 'lift-1', old.revision_id, new.revision_id, 0, 1)
+    change_view = read_export(catalog, change.product_id, 'change.json')
 ```
 
 `put_mesh` 的顶点行是 `(id,x,y,h)`，面行是 `(id,v0,v1,v2)`。标识必须是内容非空、无首尾空白的可打印字符串。数值接受整数、`Fraction` 或形如 `-3/7` 的有理数字符串。布尔、浮点、空值、退化面、重叠以及不共形接合均拒绝。公共边或公共顶点的原身份必须一致。坐标、高程及面积单位分别为米、米和平方米。空网格是合法输入。`sample` 返回 `inside` 或 `outside`，命中时携带精确高程、全部命中面及面内位置分类。
 
 `build_contours` 接收单个阈值或有限阈值序列，按规范值去重和排序。每个结果有精确等值身份、带来源的无向弧及其端点关联，孤立接触记录在节点中。`build_bands` 接收 `lo < hi`，返回半开区间 `[lo,hi)` 的分量、外环、孔洞和面积账。外环逆时针，孔洞顺时针。每个逐面单元以闭环表示几何，并记录顶点是否属于区间。单元边的开段在两端均被排除时排除。零宽上界缝由这些包含标记保存，区域面积环只表示各分量的面载体。仅点接触不合并开内部。
+
+`build_change_band` 接收有序双修订与 `lo < hi`，在两网共同覆盖内取新高程减旧高程的 `[lo,hi)` 部分，逐分量交付外环、孔洞、精确面积及按 `(旧面, 新面)` 汇总的面积贡献。两网剖分与身份可不同；同一平面点上的差值按各自场的精确仿射值计算，换剖分不引入插值误差。`read_export` 的差值路径接收单个差值成果 ID 或仅含该 ID 的序列，与其它成果混装拒绝，导出 V2 双快照自足包。交接约束与独立核账口径见 `CHANGE_BAND_HANDOFF.md`。
 
 加工请求身份同时作为成果身份。同请求同绑定返回保存数据，内容或绑定变更须使用新的请求身份。一次 `build_*` 调用原子保存一个完整成果。`read_export` 接受一个成果身份或同修订的一组成果身份，返回固定交付视图，给定目的路径时同时发布自足包。`audit` 返回带业务偏差的报告，不写回档案。业务输入和身份错误抛出明确异常，SQLite 发布失败整体回滚，导出失败保留已有目的文件。重开目录和源数据更正均不会覆盖旧修订或成果。

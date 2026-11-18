@@ -3,6 +3,7 @@ from dataclasses import dataclass
 from fractions import Fraction
 from itertools import combinations
 
+from terrain.band import independent
 from terrain.band.boundaries import point_in_ring, signed_ring_area
 from terrain.band.components import AreaLedger
 from terrain.field.affine import evaluate_height
@@ -267,9 +268,101 @@ def audit_sources(view):
             yield AuditIssue('SOURCE_MISMATCH', product.product_id, 'source is absent from the fixed mesh')
 
 
+def _check_change_binding(view, product):
+    payload = product.payload
+    revisions = tuple(revision.revision_id for revision in view.revisions)
+    if (payload.kind != 'change_band' or payload.revision_ids != revisions or
+            len(payload.levels) != 2 or payload.levels[0] >= payload.levels[1] or
+            tuple(payload.result.levels) != payload.levels):
+        return 'change band revision pair, exact levels or result binding disagree'
+    return None
+
+
+def _change_ledger(components):
+    """Per-pair ledger summed over all components, in sorted order."""
+    ledger = defaultdict(Fraction)
+    for component in components:
+        for old, new, value in component.contributions:
+            ledger[old, new] += value
+    return tuple(sorted((old, new, value) for (old, new), value in ledger.items()))
+
+
+def _ring_edges(component):
+    return tuple(edge for ring in (component.outer, *component.holes)
+                 for edge in cyclic_edges(ring.points))
+
+
+def _check_change(view, product):
+    payload = product.payload
+    if len(view.revisions) != 2:
+        return 'change band delivery requires two mesh snapshots'
+    old, new = view.revisions
+    lo, hi = payload.levels
+    old_field, new_field = bind_field(old), bind_field(new)
+    try:
+        expected_components = independent.detailed_components(old_field, new_field, lo, hi)
+    except ValueError as exc:
+        return f'change band cannot be re-derived from the packaged snapshots: {exc}'
+    actual = payload.result
+    expected_area = sum((area for area, _, _ in expected_components), Fraction())
+    if actual.area != expected_area:
+        return f'[{lo},{hi}): saved total area {actual.area} differs from re-derived {expected_area}'
+    if len(actual.components) != len(expected_components):
+        return (f'[{lo},{hi}): saved {len(actual.components)} components but the packaged '
+                f'snapshots split into {len(expected_components)}')
+    actual_keys = sorted((component.area, tuple(sorted(component.contributions)),
+                          independent.line_signature(_ring_edges(component)))
+                         for component in actual.components)
+    expected_keys = sorted((area, contributions, independent.line_signature(boundary))
+                           for area, contributions, boundary in expected_components)
+    if actual_keys != expected_keys:
+        return (f'[{lo},{hi}): component boundaries, areas or (old face, new face) contributions '
+                'differ from the packaged snapshots')
+    expected_ledger = tuple(sorted((old_face, new_face, value) for (old_face, new_face), value
+                                   in independent.pair_areas(old_field, new_field, lo, hi).items()))
+    if _change_ledger(actual.components) != expected_ledger:
+        return f'[{lo},{hi}): per-pair area ledger differs from the packaged snapshots'
+    for component in actual.components:
+        if component.area <= 0 or sum((value for _, _, value in component.contributions), Fraction()) != component.area:
+            return f'[{lo},{hi}): component contributions do not sum to its actual area'
+        pairs = [(old_face, new_face) for old_face, new_face, _ in component.contributions]
+        if pairs != sorted(set(pairs)) or any(value <= 0 for _, _, value in component.contributions):
+            return f'[{lo},{hi}): contribution rows are repeated, unordered or non-positive'
+        rings = (component.outer, *component.holes)
+        areas = tuple(signed_ring_area(ring.points) for ring in rings)
+        if areas[0] <= 0 or any(value >= 0 for value in areas[1:]):
+            return 'invalid change band ring orientation'
+        if sum(areas) != component.area or component.outer.area + sum(
+                (hole.area for hole in component.holes), Fraction()) != component.area:
+            return 'change band ring areas disagree with the component area'
+        if not all(_ring_simple(ring.points) for ring in rings):
+            return f'[{lo},{hi}): invalid change band ring topology'
+        if any(point_in_ring(point, component.outer.points) < 0
+               for hole in component.holes for point in hole.points):
+            return 'change band hole is outside its reported component'
+    return None
+
+
+def audit_change(view):
+    product, = view.products
+    issue = _check_change_binding(view, product)
+    issues = (AuditIssue('BINDING_MISMATCH', product.product_id, issue),) if issue else ()
+    if issues:
+        return AuditReport(issues, (), ())
+    geometry = _check_change(view, product)
+    issues = (AuditIssue('GEOMETRY_MISMATCH', product.product_id, geometry),) if geometry else ()
+    area = product.payload.result.area
+    return AuditReport(issues, ((product.product_id, area),), ())
+
+
 def audit(view):
     if not view.products:
         return AuditReport((AuditIssue('BINDING_MISMATCH', '', 'delivery has no products'),), (), ())
+    if any(product.payload.kind == 'change_band' for product in view.products):
+        if len(view.products) != 1:
+            return AuditReport((AuditIssue('BINDING_MISMATCH', view.products[0].product_id,
+                                           'change band must be delivered alone'),), (), ())
+        return audit_change(view)
     bindings = tuple(audit_bindings(view))
     if bindings:
         return AuditReport(bindings, (), ())

@@ -18,8 +18,9 @@ class ExportError(RuntimeError):
 
 @dataclass(frozen=True, slots=True)
 class PackageManifest:
-    revision_id: str
+    revision_id: str | None
     entries: tuple[tuple[str, str, tuple[str, ...], str], ...]
+    revisions: tuple[str, ...] = ()
 
 
 def _manifest_entry(product):
@@ -30,6 +31,8 @@ def _manifest_entry(product):
 
 def build_package(revision, products):
     products = tuple(sorted(products, key=lambda p: p.product_id))
+    if any(product.payload.kind == 'change_band' for product in products):
+        raise ExportError('change band products require the version 2 two-snapshot package')
     require_same_revision(revision.revision_id, *products)
     documents = []
     for product in products:
@@ -39,30 +42,89 @@ def build_package(revision, products):
             'manifest': {'revision': revision.revision_id, 'entries': [_manifest_entry(p) for p in documents]}}
 
 
+def build_change_package(revisions, products):
+    """Build the version 2 package holding both survey snapshots."""
+    products = tuple(sorted(products, key=lambda p: p.product_id))
+    if len(revisions) != 2 or len(products) != 1:
+        raise ExportError('change band package requires two snapshots and one product')
+    product = products[0]
+    if product.payload.kind != 'change_band' or product.payload.revision_ids != tuple(
+            revision.revision_id for revision in revisions):
+        raise ExportError('change band package binding differs from its snapshots')
+    binding, geometry, sources = encode_product(product.payload)
+    document = {'id': product.product_id, 'binding': binding, 'geometry': geometry, 'sources': sources}
+    return {'version': 2,
+            'meshes': [encode_mesh_snapshot(revision) for revision in revisions],
+            'products': [document],
+            'manifest': {'revisions': [revision.revision_id for revision in revisions],
+                         'entries': [_manifest_entry(document)]}}
+
+
+def _validate_legacy(document):
+    if (not isinstance(document, dict) or set(document) != {'version', 'mesh', 'products', 'manifest'} or
+            type(document['version']) is not int or document['version'] != 1):
+        raise CodecError('invalid delivery version or structure')
+    revision = decode_mesh_snapshot(document['mesh'])
+    products = []
+    entries = []
+    if not isinstance(document['products'], list) or not document['products']:
+        raise CodecError('delivery requires saved products')
+    for row in document['products']:
+        if not isinstance(row, dict) or set(row) != {'id', 'binding', 'geometry', 'sources'}:
+            raise CodecError('invalid packaged product structure')
+        payload = decode_product(row['binding'], row['geometry'], row['sources'])
+        if payload.kind == 'change_band':
+            raise CodecError('change band requires two mesh snapshots')
+        products.append(ArchivedProduct(identity(row['id']), payload))
+        entries.append(_manifest_entry(row))
+    ids = [product.product_id for product in products]
+    if ids != sorted(set(ids)):
+        raise CodecError('duplicate or unordered packaged products')
+    require_same_revision(revision.revision_id, *products)
+    if document['manifest'] != {'revision': revision.revision_id, 'entries': entries}:
+        raise CodecError('delivery manifest differs from saved product binding or content')
+    manifest = PackageManifest(revision.revision_id, tuple((p, k, tuple(v), d) for p, k, v, d in entries),
+                               (revision.revision_id,))
+    return manifest, (revision,), tuple(products)
+
+
+def _validate_change(document):
+    if set(document) != {'version', 'meshes', 'products', 'manifest'}:
+        raise CodecError('invalid delivery version or structure')
+    meshes = document['meshes']
+    if not isinstance(meshes, list) or len(meshes) != 2:
+        raise CodecError('change band delivery requires two mesh snapshots')
+    revisions = tuple(decode_mesh_snapshot(snapshot) for snapshot in meshes)
+    rows = document['products']
+    if not isinstance(rows, list) or len(rows) != 1:
+        raise CodecError('change band delivery holds exactly one product')
+    row = rows[0]
+    if not isinstance(row, dict) or set(row) != {'id', 'binding', 'geometry', 'sources'}:
+        raise CodecError('invalid packaged product structure')
+    payload = decode_product(row['binding'], row['geometry'], row['sources'])
+    if payload.kind != 'change_band':
+        raise CodecError('change band delivery requires a change band product')
+    if payload.revision_ids != tuple(revision.revision_id for revision in revisions):
+        raise CodecError('change band binding differs from the packaged mesh snapshots')
+    product = ArchivedProduct(identity(row['id']), payload)
+    entries = [_manifest_entry(row)]
+    if document['manifest'] != {'revisions': [revision.revision_id for revision in revisions],
+                                'entries': entries}:
+        raise CodecError('delivery manifest differs from saved product binding or content')
+    manifest = PackageManifest(None, tuple((p, k, tuple(v), d) for p, k, v, d in entries),
+                               tuple(revision.revision_id for revision in revisions))
+    return manifest, revisions, (product,)
+
+
 def validate_package(document):
     try:
-        if (not isinstance(document, dict) or set(document) != {'version', 'mesh', 'products', 'manifest'} or
-                type(document['version']) is not int or document['version'] != 1):
+        if not isinstance(document, dict) or type(document.get('version')) is not int:
             raise CodecError('invalid delivery version or structure')
-        revision = decode_mesh_snapshot(document['mesh'])
-        products = []
-        entries = []
-        if not isinstance(document['products'], list) or not document['products']:
-            raise CodecError('delivery requires saved products')
-        for row in document['products']:
-            if not isinstance(row, dict) or set(row) != {'id', 'binding', 'geometry', 'sources'}:
-                raise CodecError('invalid packaged product structure')
-            payload = decode_product(row['binding'], row['geometry'], row['sources'])
-            products.append(ArchivedProduct(identity(row['id']), payload))
-            entries.append(_manifest_entry(row))
-        ids = [product.product_id for product in products]
-        if ids != sorted(set(ids)):
-            raise CodecError('duplicate or unordered packaged products')
-        require_same_revision(revision.revision_id, *products)
-        if document['manifest'] != {'revision': revision.revision_id, 'entries': entries}:
-            raise CodecError('delivery manifest differs from saved product binding or content')
-        manifest = PackageManifest(revision.revision_id, tuple((p, k, tuple(v), d) for p, k, v, d in entries))
-        return manifest, revision, tuple(products)
+        if document['version'] == 1:
+            return _validate_legacy(document)
+        if document['version'] == 2:
+            return _validate_change(document)
+        raise CodecError('unsupported delivery version')
     except (ValueError, TypeError, KeyError) as exc:
         raise ExportError(f'invalid delivery binding or package: {exc}') from exc
 
